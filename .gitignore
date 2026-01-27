@@ -1,0 +1,8 @@
+node_modules
+.env
+.env.example
+*.pdf
+models_list.txt
+ingestion_progress.json
+__pycache__
+*.pyc
