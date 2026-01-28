@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pinecone } = require('@pinecone-database/pinecone');
-const { CohereClient } = require('cohere-ai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(cors());
@@ -18,7 +18,7 @@ app.use((err, req, res, next) => {
 });
 
 // --- CONFIGURATION CHECKS ---
-const requiredEnv = ['GOOGLE_API_KEY', 'PINECONE_API_KEY', 'PINECONE_INDEX', 'COHERE_API_KEY'];
+const requiredEnv = ['GOOGLE_API_KEY', 'PINECONE_API_KEY', 'PINECONE_INDEX'];
 const missingEnv = requiredEnv.filter(key => !process.env[key]);
 
 if (missingEnv.length > 0) {
@@ -29,10 +29,10 @@ if (missingEnv.length > 0) {
 
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pc.index(process.env.PINECONE_INDEX);
-const cohere = new CohereClient({ token: process.env.COHERE_API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 /**
- * Generates embeddings using Google's gemini-embedding-001 model.
+ * Generates embeddings using Google's gemini-embedding-001 model via REST.
  * Forces output to 768 dimensions to match the existing Pinecone index.
  */
 async function generateEmbedding(text) {
@@ -46,7 +46,7 @@ async function generateEmbedding(text) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 content: { parts: [{ text: text }] },
-                output_dimensionality: 768 // IMPORTANT: Matches your medical database
+                output_dimensionality: 3072
             })
         });
 
@@ -63,9 +63,16 @@ async function generateEmbedding(text) {
 }
 
 // --- CHAT ENDPOINT ---
+// --- HEALTH CHECK FOR AWS APP RUNNER ---
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: "ok", service: "medical-chatbot" });
+});
+
 app.post('/chat', async (req, res) => {
     try {
         const { message } = req.body;
+        if (!message) return res.status(400).json({ error: "Message is required" });
+
         console.log(`\n💬 User Query: "${message}"`);
 
         // 1. Convert user query to vector
@@ -82,20 +89,16 @@ app.post('/chat', async (req, res) => {
         // 3. Extract relevant medical text
         const contexts = searchResponse.matches
             .map(match => match.metadata.text)
-            .filter(text => text !== undefined);
+            .filter(text => text !== undefined)
+            .join("\n\n---\n\n");
 
-        console.log(`✅ Retrieved ${contexts.length} relevant sections.`);
+        console.log(`✅ Retrieved ${searchResponse.matches.length} relevant sections.`);
 
-        // 4. Generate structured response with Cohere
-        console.log("Synthesizing answer...");
-        const chatResponse = await cohere.chat({
-            model: 'command-r-08-2024',
-            message: message,
-            documents: contexts.map((text, i) => ({
-                title: `Medical Context ${i + 1}`,
-                snippet: text
-            })),
-            preamble: `You are an expert medical assistant and knowledgeable AI chatbot specializing in internal medicine. Your goal is to assist users by providing accurate, professional, and concise medical information based strictly on the provided context from Harrison's Principles of Internal Medicine.
+        // 4. Generate structured response with Gemini
+        console.log("⚡ Synthesizing answer with Gemini (gemini-2.0-flash)...");
+        const chatModel = genAI.getGenerativeModel({
+            model: "gemini-2.0-flash",
+            systemInstruction: `You are an expert medical assistant and knowledgeable AI chatbot specializing in internal medicine. Your goal is to assist users by providing accurate, professional, and concise medical information based strictly on the provided context from Harrison's Principles of Internal Medicine.
 
 Instructions:
 1. Use a professional and empathetic tone.
@@ -104,10 +107,21 @@ Instructions:
 4. Format your response clearly using Markdown (bullet points or numbered lists).`
         });
 
-        console.log("\n🤖 Response Generated Successfully.");
+        const prompt = `Context from medical records:\n${contexts}\n\nUser Question: ${message}`;
+
+        const startTime = Date.now();
+        const result = await chatModel.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+
+        console.log(`\n🤖 Bot Response (Generated in ${duration}s):`);
+        console.log("----------------------------------------");
+        console.log(text);
+        console.log("----------------------------------------");
 
         res.json({
-            answer: chatResponse.text,
+            answer: text,
             citations: searchResponse.matches.map(m => m.metadata.source || `Medical Manual P.${m.metadata.page || "?"}`)
         });
 
@@ -120,7 +134,7 @@ Instructions:
     }
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`\n🚀 Medical Chatbot Server Live on port ${PORT}`);
     console.log(`📡 Connected to Pinecone Index: ${process.env.PINECONE_INDEX}`);
